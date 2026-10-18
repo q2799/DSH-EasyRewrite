@@ -281,12 +281,12 @@ window.__ModuleLoader__.load({
             log("info", "attach", "已构造 File 并写缓存", { name: name, type: ref.mediaType || blob.type, size: blob.size });
           } catch (e) { log("warn", "attach", "重建单个附件失败", { attachmentId: ref.attachmentId, err: String(e && e.message ? e.message : e) }); }
         }
-        if (files.length > 0 && ctxConversationRef && typeof ctxConversationRef.createDraftImages === "function" && typeof props.inputActions !== "undefined" && typeof props.inputActions.addImages === "function") {
+        if (files.length > 0 && canCreateDraftImages()) {
           try {
-            var images = ctxConversationRef.createDraftImages(files);
+            var images = createDraftImagesCompat(sessionId, files);
             if (images && images.length > 0) {
               var ids = images.map(function (img) { return img.id; });
-              var addOk = props.inputActions.addImages(ids);
+              var addOk = addDraftAttachmentsCompat(props.inputActions, ids);
               if (recordPending) { for (var pi = 0; pi < ids.length; pi++) pendingAttachIds.push(ids[pi]); }
               log("info", "attach", "createDraftImages+addImages 成功", { count: images.length, addOk: addOk });
               added = images.length;
@@ -298,7 +298,7 @@ window.__ModuleLoader__.load({
           }
         } else {
           if (files.length === 0) log("warn", "attach", "无可重建文件（缓存未命中+resolveImage/fetch 均失败）", { refsLen: attachmentRefs.length });
-          else log("warn", "attach", "缺 createDraftImages 或 addImages 能力", { hasCCI: !!(ctxConversationRef && typeof ctxConversationRef.createDraftImages === "function"), hasAdd: !!(props.inputActions && typeof props.inputActions.addImages === "function") });
+          else log("warn", "attach", "缺 createDraftImages 或 addImages 能力", { hasCCI: canCreateDraftImages(), hasAdd: !!(props.inputActions && (typeof props.inputActions.addAttachments === "function" || typeof props.inputActions.addImages === "function")) });
         }
       } catch (e) { log("error", "attach", "rebuildDraftAttachments 外层异常", { err: String(e && e.message ? e.message : e) }); }
       return added;
@@ -370,7 +370,7 @@ window.__ModuleLoader__.load({
     async function bridgeSessionImages(sessionId, refs) {
       var out = [];
       try {
-        if (!refs || !refs.length || !ctxConversationRef || typeof ctxConversationRef.createDraftImages !== "function") return out;
+        if (!refs || !refs.length || !canCreateDraftImages()) return out;
         var files = [];
         for (var i = 0; i < refs.length; i++) {
           var ref = refs[i];
@@ -386,7 +386,7 @@ window.__ModuleLoader__.load({
           } catch (eOne) { log("warn", "attach", "桥接单个附件失败", { attachmentId: ref.attachmentId, err: String(eOne && eOne.message ? eOne.message : eOne) }); }
         }
         if (files.length > 0) {
-          var imgs = ctxConversationRef.createDraftImages(files);
+          var imgs = createDraftImagesCompat(sessionId, files);
           out = imgs.map(function (im) { return im.id; });
           log("info", "attach", "图片桥接完成（进官方单例）", { count: out.length });
         }
@@ -417,6 +417,36 @@ window.__ModuleLoader__.load({
     var ctxConversationRef = null; // apply 时注入 conversation 服务
     var ctxUiConversationRef = null; // v2.4.0: dsh 0.1.2 的 uiConversation 服务（弱引用；0.1.1-rc.2 无此服务时为 null）
     var ctxUiWorkspaceRef = null;    // v2.4.0: dsh 0.1.2 的 uiWorkspace 服务（弱引用）
+    // 宿主 API 改名兼容层。0.2.x 起 conversation 服务把 createDraftImages(files)
+    // 改成 createDrafts(sessionId, files)；input 门面的 addImages(ids) 改成 addAttachments(ids)。
+    // 两代同时支持，避免再出现"判空静默失效"（旧代码只认一个名字，改名后整条链路死掉且无任何日志）。
+    /** 注册图片草稿：新签名 createDrafts(sessionId, files) → 旧签名 createDraftImages(files) */
+    function createDraftImagesCompat(sessionId, files) {
+      if (!files || files.length === 0) return [];
+      if (!ctxConversationRef) return [];
+      try {
+        if (typeof ctxConversationRef.createDrafts === "function") {
+          return ctxConversationRef.createDrafts(sessionId, files) || [];
+        }
+        if (typeof ctxConversationRef.createDraftImages === "function") {
+          return ctxConversationRef.createDraftImages(files) || [];
+        }
+      } catch (eCD) { log("error", "attach", "创建图片草稿抛错", { err: String(eCD && eCD.message ? eCD.message : eCD), filesLen: files.length }); }
+      return [];
+    }
+    /** 是否具备注册图片草稿的能力（生产判断用，不产生副作用） */
+    function canCreateDraftImages() {
+      return !!ctxConversationRef && (typeof ctxConversationRef.createDrafts === "function" || typeof ctxConversationRef.createDraftImages === "function");
+    }
+    /** 挂载图片草稿到输入框：新签名 addAttachments(ids) → 旧签名 addImages(ids) */
+    function addDraftAttachmentsCompat(inputActions, ids) {
+      if (!inputActions || !ids || ids.length === 0) return false;
+      try {
+        if (typeof inputActions.addAttachments === "function") return inputActions.addAttachments(ids);
+        if (typeof inputActions.addImages === "function") return inputActions.addImages(ids);
+      } catch (eAA) { log("warn", "attach", "挂载附件到输入框抛错", { err: String(eAA && eAA.message ? eAA.message : eAA) }); }
+      return false;
+    }
     /** v2.4.0：图片 URL 解析双宿主兼容——props.loadImage（两代都有）/ rc.2 resolveImage / rc.1 uiConversation.imageUrl */
     async function resolveImageCompat(sessionId, ref, props) {
       if (props && typeof props.loadImage === "function") {
@@ -1231,8 +1261,8 @@ window.__ModuleLoader__.load({
             // 图片桥接（review #3 简化版）：官方 draftAttachments 全局单例跨会话存活——
             // resume 直接 addImages(发送瞬间的 imageIds) 后 submit；消息内容完全由我们构造，无需校验。
             var savedIds = Array.isArray(r.imageIds) ? r.imageIds : [];
-            if (savedIds.length > 0 && typeof ia.addImages === "function") {
-              try { ia.addImages(savedIds); } catch (e) { log("warn", "attach", "addImages 异常（忽略，文字照发）", { err: String(e && e.message ? e.message : e) }); }
+            if (savedIds.length > 0) {
+              try { addDraftAttachmentsCompat(ia, savedIds); } catch (e) { log("warn", "attach", "addImages 异常（忽略，文字照发）", { err: String(e && e.message ? e.message : e) }); }
             }
             // Issue #10 深度防御：清空宿主 fork 继承而来的悬空 next-turn 幽灵队列
             // DSH 的 sessions.fork 机制会贪婪复制 turn/end 到 turn/start 之间的非回合事件，
@@ -1305,8 +1335,8 @@ window.__ModuleLoader__.load({
                             ia.setDraft(stg.text);
                           }
                           var stgImgs = Array.isArray(stg.imageIds) ? stg.imageIds : [];
-                          if (stgImgs.length > 0 && typeof ia.addImages === "function") {
-                            ia.addImages(stgImgs);
+                          if (stgImgs.length > 0) {
+                            addDraftAttachmentsCompat(ia, stgImgs);
                           }
                           log("info", "recall", "resume 第二阶段：底部暂存草稿及图片已回填", {
                             hasText: !!(stg.text && stg.text.length > 0),
@@ -1364,16 +1394,167 @@ window.__ModuleLoader__.load({
       return { text: texts.join(""), images: images, rest: rest };
     }
 
-    // 渲染消息图片缩略图：直调官方 renderMessageImages（官方 ImageGallery：大图/宫格/lightbox/重试）。
-    // 方法论 review #1：chat.node 注入必带该 prop，自绘 <img> 兜底属重复造轮子——已删；失败 warn 不静默。
+    // ---------- 用户消息图片渲染（v2.6.1 / 方案A：自绘） ----------
+    // 事实核对（dsh 0.2.1-rc.2 源码）：
+    //   1. 官方图片画廊挂在 conversation.chat.user.images 子槽，只有 conversation.chat.user.content
+    //      这条 entry 声明了 children 才会被注入 renderSlot；本插件以 key "user" 覆盖的是
+    //      conversation.chat.node —— 它的 owner props 里从来没有 renderMessageImages，
+    //      于是旧实现每次都落到 null，图片静默消失。
+    //   2. 覆盖后 items 仍会拿到 loadImage（ChatNodeSeat owner 里透传的会话授权 URL 加载器），
+    //      所以自绘是唯一不依赖宿主槽声明的通路。
+    //   3. 观感对齐官方 ui-attachment：单图长边 240px、宽高比 clamp 到 [0.25, 4]、超出部分裁切；
+    //      多图 64px 方格；点开大图。
+    var MIMG_GALLERY_STYLE = {
+      display: "flex", flexWrap: "wrap", gap: "10px", maxWidth: "100%",
+      justifyContent: "flex-end", alignSelf: "flex-end"
+    };
+    var MIMG_FRAME_STYLE = {
+      border: "0.5px solid var(--dsw-alias-border-l2-darkmode-thin, rgba(128,128,128,0.3))",
+      borderRadius: "var(--dsw-radius-xl, 12px)",
+      background: "var(--dsw-alias-interactive-bg-hover, rgba(128,128,128,0.12))",
+      cursor: "zoom-in", flex: "none", minWidth: 44, minHeight: 44,
+      padding: 0, display: "grid", placeItems: "center", overflow: "hidden"
+    };
+    var MIMG_TILE_STYLE = { width: 64, minWidth: 64, height: 64, minHeight: 64 };
+    var MIMG_IMG_STYLE = { objectFit: "cover", width: "100%", height: "100%", display: "block" };
+
+    /** 单图展示尺寸：官方 singleFit 的同款算法（长边 240，比例 clamp，绝不放大超过原图）。 */
+    function userImageFitStyle(att) {
+      var w = att && typeof att.width === "number" ? att.width : 0;
+      var h = att && typeof att.height === "number" ? att.height : 0;
+      if (!(w > 0 && h > 0)) return { width: 240, height: 240, objectPosition: "center" };
+      var natural = w / h;
+      var ratio = Math.min(4, Math.max(0.25, natural));
+      var box = ratio >= 1 ? { width: 240, height: 240 / ratio } : { width: 240 * ratio, height: 240 };
+      var scale = Math.min(1, w / box.width, h / box.height);
+      return {
+        width: Math.max(1, Math.round(box.width * scale)),
+        height: Math.max(1, Math.round(box.height * scale)),
+        objectPosition: natural < 0.25 ? "center top" : (natural > 4 ? "left center" : "center")
+      };
+    }
+
+    /** 点开大图：全屏遮罩，Esc / 点击空白关闭，锁滚动。 */
+    function UserImageLightbox(props) {
+      React.useEffect(function () {
+        function onKey(e) { if (e.key === "Escape") props.onClose(); }
+        document.addEventListener("keydown", onKey);
+        var prev = document.body.style.overflow;
+        document.body.style.overflow = "hidden";
+        return function () {
+          document.removeEventListener("keydown", onKey);
+          document.body.style.overflow = prev;
+        };
+      }, []);
+      return React.createElement("div", {
+        onClick: props.onClose,
+        style: {
+          position: "fixed", inset: 0, zIndex: 2147483000,
+          background: "rgba(0,0,0,0.82)", display: "flex",
+          alignItems: "center", justifyContent: "center",
+          cursor: "zoom-out", padding: "24px"
+        }
+      }, React.createElement("img", {
+        src: props.src,
+        alt: props.alt || "",
+        onClick: function (e) { e.stopPropagation(); },
+        style: {
+          maxWidth: "100%", maxHeight: "100%", objectFit: "contain",
+          borderRadius: "8px", boxShadow: "0 8px 40px rgba(0,0,0,0.5)"
+        }
+      }));
+    }
+
+    /** 单张历史图片：loadImage(attachment) → 授权 URL → <img>；失败可点重试。 */
+    function UserMessageImage(props) {
+      var image = props.image;
+      var att = image && image.attachment;
+      var load = props.load;
+      var peeked = null;
+      try {
+        if (att && load && typeof load.peek === "function") peeked = load.peek(att) || null;
+      } catch (ePeek) { peeked = null; }
+      var urlSt = React.useState(peeked);
+      var url = urlSt[0], setUrl = urlSt[1];
+      var failSt = React.useState(false);
+      var failed = failSt[0], setFailed = failSt[1];
+      var trySt = React.useState(0);
+      var attempt = trySt[0], setAttempt = trySt[1];
+      var openSt = React.useState(false);
+      var open = openSt[0], setOpen = openSt[1];
+      React.useEffect(function () {
+        if (!att) { setFailed(true); return; }
+        var live = true;
+        setFailed(false);
+        var p = null;
+        try { p = typeof load === "function" ? load(att) : null; } catch (eLoad) { p = null; }
+        if (!p || typeof p.then !== "function") { setFailed(true); return; }
+        p.then(function (u) { if (live) { if (u) setUrl(u); else setFailed(true); } },
+          function () { if (live) setFailed(true); });
+        return function () { live = false; };
+      }, [att, attempt]);
+      var tile = props.variant === "tile";
+      var frameStyle = tile
+        ? Object.assign({}, MIMG_FRAME_STYLE, MIMG_TILE_STYLE, { cursor: "zoom-in" })
+        : Object.assign({}, MIMG_FRAME_STYLE, userImageFitStyle(att));
+      if (failed) {
+        return React.createElement("button", {
+          type: "button",
+          title: "图片加载失败，点击重试",
+          onClick: function (e) { e.stopPropagation(); if (open) setOpen(false); setUrl(null); setAttempt(attempt + 1); },
+          style: Object.assign({}, MIMG_FRAME_STYLE, tile ? MIMG_TILE_STYLE : { maxWidth: 240, padding: "10px 12px" }, { cursor: "pointer", color: "var(--dsw-alias-label-tertiary, rgba(128,128,128,0.85))", fontSize: 12, lineHeight: "18px" })
+        }, "图片加载失败，点击重试");
+      }
+      return React.createElement(React.Fragment, null,
+        React.createElement("button", {
+          type: "button",
+          className: "dsh-easyrewrite-img",
+          title: att && att.name ? att.name : "查看大图",
+          onClick: function (e) { e.stopPropagation(); if (url) setOpen(true); },
+          style: frameStyle
+        }, url
+          ? React.createElement("img", { src: url, alt: (att && att.name) || "", style: tile ? MIMG_IMG_STYLE : Object.assign({}, MIMG_IMG_STYLE, { objectPosition: frameStyle.objectPosition }) })
+          : React.createElement("span", { style: { fontSize: 12, color: "var(--dsw-alias-label-tertiary, rgba(128,128,128,0.85))" } }, "加载中…")),
+        open && url ? React.createElement(UserImageLightbox, {
+          src: url,
+          alt: (att && att.name) || "",
+          onClose: function () { setOpen(false); }
+        }) : null);
+    }
+
+    /** 一条消息里的全部图片：单图走大图尺寸，多图走 64px 宫格（官方 ImageGallery 同一规则）。 */
+    function UserMessageImages(props) {
+      var images = props.images || [];
+      if (images.length === 0) return null;
+      var compact = images.length > 1;
+      return React.createElement("div", {
+        style: MIMG_GALLERY_STYLE,
+        "data-dsh-easyrewrite-images": String(images.length),
+        "data-align": "end"
+      }, images.map(function (img, i) {
+        var aid = img && img.attachment && img.attachment.attachmentId ? img.attachment.attachmentId : "idx" + i;
+        return React.createElement(UserMessageImage, {
+          key: aid + ":" + i,
+          image: img,
+          load: props.loadImage,
+          variant: compact ? "tile" : "single"
+        });
+      }));
+    }
+
+    // 渲染消息图片：宿主若仍提供官方 renderMessageImages 就用它（前瞻兼容），
+    // 否则退回自绘（当前 0.2.1-rc.2 的真实路径）。
     function renderMessageImagesCompat(images, props) {
       if (!images || images.length === 0) return null;
-      if (!props || typeof props.renderMessageImages !== "function") {
-        log("warn", "attach", "renderMessageImages prop 缺失（官方注入面变化？），图片无法渲染");
-        return null;
+      if (props && typeof props.renderMessageImages === "function") {
+        try { return props.renderMessageImages({ images: images, align: "end" }); }
+        catch (e) { log("warn", "attach", "官方图片渲染抛错，退回自绘", { err: String(e && e.message ? e.message : e) }); }
       }
-      try { return props.renderMessageImages({ images: images, align: "end" }); }
-      catch (e) { log("warn", "attach", "官方图片渲染抛错", { err: String(e && e.message ? e.message : e) }); return null; }
+      if (props && typeof props.loadImage === "function") {
+        return React.createElement(UserMessageImages, { images: images, loadImage: props.loadImage });
+      }
+      log("warn", "attach", "loadImage prop 缺失（宿主注入面变化？），图片无法渲染");
+      return null;
     }
 
     function iconImg(src, alt, size) {
@@ -2990,6 +3171,25 @@ window.__ModuleLoader__.load({
           writePending(sessionId, Object.assign({}, p, { editImgs: snap, updatedAt: Date.now() }));
         } catch (eSp) { /* ignore */ }
       }
+      /**
+       * 释放编辑态主动丢弃的图片草稿（object URL + 上传句柄）。
+       * 此前只有 cancelEdit 会释放，而"点 × 移除单张"只从列表里摘掉、宿主侧草稿仍常驻，
+       * 反复进编辑+移除会持续泄漏 previewUrl。延迟到下一帧执行：先让 React 卸掉缩略图 DOM，
+       * 避免 revokePreview 后闪现破图（与 cancelEdit 同款时序）。
+       * 注意：确认重发路径**不能**释放——新会话 resume 要复用同一批 id（见 confirmEdit 注释）。
+       */
+      function releaseEditImage(id, reason) {
+        if (!id) return;
+        try {
+          if (!ctxConversationRef || typeof ctxConversationRef.releaseDraftAttachment !== "function") return;
+          setTimeout(function () {
+            try {
+              ctxConversationRef.releaseDraftAttachment(id);
+              log("debug", "edit", "已释放编辑图片草稿", { id: id, reason: reason || "" });
+            } catch (eRel) { /* ignore */ }
+          }, 0);
+        } catch (eRelAll) { /* ignore */ }
+      }
       React.useEffect(function () {
         if (!isEditPending || editing) return;
         setEditing(true);
@@ -3004,13 +3204,13 @@ window.__ModuleLoader__.load({
             var refs = (cachedEditMsg[myKey] && cachedEditMsg[myKey].attachRefs) || [];
             for (var ri = 0; ri < refs.length; ri++) {
               try {
-                if (!ctxConversationRef || typeof ctxConversationRef.createDraftImages !== "function") break;
-                var rUrl = await resolveImageCompat(sessionId, refs[ri], null);
+                if (!canCreateDraftImages()) break;
+                var rUrl = await resolveImageCompat(sessionId, refs[ri], props);
                 if (!rUrl) continue;
                 var rResp = await fetch(rUrl);
                 if (!rResp.ok) continue;
                 var rBlob = await rResp.blob();
-                var rD = ctxConversationRef.createDraftImages([new File([rBlob], refs[ri].name || "image.png", { type: refs[ri].mediaType || rBlob.type || "image/png" })]);
+                var rD = createDraftImagesCompat(sessionId, [new File([rBlob], refs[ri].name || "image.png", { type: refs[ri].mediaType || rBlob.type || "image/png" })]);
                 if (rD && rD.length > 0) items.push({ id: rD[0].id, url: rD[0].previewUrl, dataUrl: null });
               } catch (eRo) { log("warn", "edit", "恢复原图失败", { err: String(eRo && eRo.message ? eRo.message : eRo) }); }
             }
@@ -3020,8 +3220,8 @@ window.__ModuleLoader__.load({
               var sv = savedList[si];
               if (!sv || !sv.dataUrl) continue;
               try {
-                if (!ctxConversationRef || typeof ctxConversationRef.createDraftImages !== "function") break;
-                var sD = ctxConversationRef.createDraftImages([dataUrlToFile(sv.dataUrl)]);
+                if (!canCreateDraftImages()) break;
+                var sD = createDraftImagesCompat(sessionId, [dataUrlToFile(sv.dataUrl)]);
                 if (sD && sD.length > 0) items.push({ id: sD[0].id, url: sD[0].previewUrl, dataUrl: sv.dataUrl });
               } catch (eRa) { log("warn", "edit", "恢复拖入图失败", { err: String(eRa && eRa.message ? eRa.message : eRa) }); }
             }
@@ -3259,26 +3459,33 @@ window.__ModuleLoader__.load({
                 if (df.type && df.type.indexOf("image") === 0) imgFiles.push(df);
               }
             }
-            if (imgFiles.length === 0 || !ctxConversationRef || typeof ctxConversationRef.createDraftImages !== "function") return;
+            if (imgFiles.length === 0) return;
+            if (!canCreateDraftImages()) {
+              log("warn", "edit", "拖入图片跳过：缺创建草稿能力", { count: imgFiles.length, isBubble: isBubble, isBottom: isBottom, hasConversation: !!ctxConversationRef });
+              return;
+            }
 
             if (isBottom) {
               // 分流 A：释放到底部输入框暂存区
-              var bImgs = ctxConversationRef.createDraftImages(imgFiles);
+              var bImgs = createDraftImagesCompat(sessionId, imgFiles);
               if (bImgs && bImgs.length > 0) {
                 var bIds = bImgs.map(function (im) { return im.id; });
-                if (props.inputActions && typeof props.inputActions.addImages === "function") {
-                  props.inputActions.addImages(bIds);
-                }
+                addDraftAttachmentsCompat(props.inputActions, bIds);
                 stagedBottomImageIdsRef.current = stagedBottomImageIdsRef.current.concat(bIds);
-                log("info", "edit", "图片已添加到底部输入框暂存区", { count: bIds.length, ids: bIds });
+                log("info", "edit", "图片已添加到底部输入框暂存区", { count: bIds.length, ids: bIds, names: imgFiles.map(function (f) { return f.name || ""; }) });
+              } else {
+                log("warn", "edit", "图片添加到底部输入框失败：草稿为空", { count: imgFiles.length });
               }
               return;
             }
 
-            if (!isBubble) return;
+            if (!isBubble) {
+              log("warn", "edit", "拖入图片未命中放置区，已忽略", { count: imgFiles.length });
+              return;
+            }
 
             // 分流 B：释放到气泡编辑区（修改当前消息）
-            var dImgs = ctxConversationRef.createDraftImages(imgFiles);
+            var dImgs = createDraftImagesCompat(sessionId, imgFiles);
             var addedItems = dImgs.map(function (im) { return { id: im.id, url: im.previewUrl, dataUrl: null }; });
             // 异步补 dataUrl 字节快照（bug② 刷新后可重建）
             for (var ai = 0; ai < addedItems.length; ai++) {
@@ -3294,7 +3501,7 @@ window.__ModuleLoader__.load({
               })(addedItems[ai], imgFiles[ai]);
             }
             setEditImages(function (prev) { var nxt = prev.concat(addedItems); syncEditImgsToPending(nxt); return nxt; });
-            log("info", "edit", "拦截到拖入图片至气泡", { count: addedItems.length });
+            log("info", "edit", "拦截到拖入图片至气泡", { count: addedItems.length, names: imgFiles.map(function (f) { return f.name || ""; }) });
           } catch (eDr) { log("warn", "edit", "拖入拦截异常", { err: String(eDr && eDr.message ? eDr.message : eDr) }); }
         }
         function onDragLeave(e) {
@@ -3502,11 +3709,15 @@ window.__ModuleLoader__.load({
                   var eBlob = await eResp.blob();
                   eFiles.push(new File([eBlob], _er[ei2].name || "image.png", { type: _er[ei2].mediaType || eBlob.type || "image/png" }));
                 }
-                if (eFiles.length > 0 && ctxConversationRef && typeof ctxConversationRef.createDraftImages === "function") {
-                  var eDrafts = ctxConversationRef.createDraftImages(eFiles);
+                if (eFiles.length > 0 && canCreateDraftImages()) {
+                  var eDrafts = createDraftImagesCompat(sessionId, eFiles);
                   var newItems = eDrafts.map(function(im) { return { id: im.id, url: im.previewUrl }; });
                   setEditImages(function(prev) { return prev.concat(newItems); });
                   log("info", "edit", "enterEdit 图片桥接完成", { count: newItems.length });
+                } else if (eFiles.length > 0) {
+                  log("warn", "edit", "enterEdit 图片桥接跳过：缺创建草稿能力", { filesLen: eFiles.length, hasConversation: !!ctxConversationRef });
+                } else {
+                  log("warn", "edit", "enterEdit 图片桥接失败：原图字节全部取回失败", { refsLen: _er.length });
                 }
               } catch (eBe) { log("warn", "edit", "enterEdit 图片桥接异常", { err: String(eBe && eBe.message ? eBe.message : eBe) }); }
             })();
@@ -3515,8 +3726,26 @@ window.__ModuleLoader__.load({
       }
       function cancelEdit() {
         if (isEditPending) writePending(sessionId, null);
+        // 先取编辑态草稿 id，再清空态——避免依赖 React 异步渲染时序。
+        var relIds = [];
+        try {
+          relIds = (editImagesRef.current || []).map(function (x) { return x && x.id; }).filter(Boolean);
+        } catch (eCol) { relIds = []; }
+        setEditImages([]);
         setEditing(false);
         log("info", "edit", "编辑取消（原样不变）");
+        // 释放编辑态注册的图片草稿（object URL / 上传句柄），避免反复进出编辑泄漏。
+        // 延迟到下一帧：先让 React 卸载缩略图 DOM，避免 revokePreview 后闪现破图。
+        // 只释放本组件为编辑态新建的 id，宿主输入框自己的附件不在此列。
+        try {
+          if (relIds.length > 0 && ctxConversationRef && typeof ctxConversationRef.releaseDraftAttachment === "function") {
+            setTimeout(function () {
+              for (var rli = 0; rli < relIds.length; rli++) {
+                try { ctxConversationRef.releaseDraftAttachment(relIds[rli]); } catch (eRel) { /* ignore */ }
+              }
+            }, 0);
+          }
+        } catch (eRelAll) { /* ignore */ }
       }
       var editInFlight = false; // review M2：编辑重发并发锁
       async function confirmEdit() {
@@ -3717,11 +3946,31 @@ window.__ModuleLoader__.load({
                   var df = dt.files[di];
                   if (df.type && df.type.indexOf("image") === 0) imgFiles.push(df);
                 }
-                if (imgFiles.length > 0 && ctxConversationRef && typeof ctxConversationRef.createDraftImages === "function") {
-                  var dImgs = ctxConversationRef.createDraftImages(imgFiles);
-                  var newItems = dImgs.map(function(im) { return { id: im.id, url: im.previewUrl }; });
-                  setEditImages(function(prev) { return prev.concat(newItems); });
-                  log("info", "edit", "拖入图片已加入编辑", { count: newItems.length });
+                if (imgFiles.length > 0 && canCreateDraftImages()) {
+                  var dImgs = createDraftImagesCompat(sessionId, imgFiles);
+                  // 与 onPaste 对齐——dataUrl 占位 + 写回 pending。
+                  // 旧实现只给 {id,url} 且不 sync，而刷新恢复要求 sv.dataUrl 非空，
+                  // 于是"拖进编辑框的图片一刷新就没了"，粘贴的却不会丢。
+                  var newItems = dImgs.map(function(im) { return { id: im.id, url: im.previewUrl, dataUrl: null }; });
+                  setEditImages(function(prev) { var nxt = prev.concat(newItems); syncEditImgsToPending(nxt); return nxt; });
+                  log("info", "edit", "拖入图片已加入编辑", { count: newItems.length, names: imgFiles.map(function(f) { return f && f.name ? f.name : ""; }) });
+                  // 逐张补字节快照（createDrafts 是 files.map 保序，下标可配对）
+                  newItems.forEach(function (it, idx) {
+                    var srcFile = imgFiles[idx];
+                    if (!srcFile) return;
+                    fileToDataUrl(srcFile).then(function (du) {
+                      it.dataUrl = du;
+                      setEditImages(function (prev2) {
+                        var nxt2 = prev2.map(function (x) { return x.id === it.id ? Object.assign({}, x, { dataUrl: du }) : x; });
+                        syncEditImgsToPending(nxt2);
+                        return nxt2;
+                      });
+                    }).catch(function (eDu) {
+                      log("warn", "edit", "拖入图片字节快照失败（刷新后无法恢复）", { id: it.id, err: String(eDu && eDu.message ? eDu.message : eDu) });
+                    });
+                  });
+                } else if (imgFiles.length > 0) {
+                  log("warn", "edit", "拖入图片跳过：缺创建草稿能力", { count: imgFiles.length, hasConversation: !!ctxConversationRef });
                 }
               } catch (eDr) { log("warn", "edit", "拖入处理异常", { err: String(eDr && eDr.message ? eDr.message : eDr) }); }
             },
@@ -3767,7 +4016,7 @@ window.__ModuleLoader__.load({
               // boxSizing:border-box：1px 边框计入 thumbSize（content-box 下每张多占 2px，会挤走第 4 张——已踩坑）
               return React.createElement("div", { key: ei.id, style: { position: "relative", boxSizing: "border-box", width: thumbSize + "px", height: thumbSize + "px", borderRadius: "8px", overflow: "hidden", border: "1px solid var(--dsw-alias-border-l2, rgba(128,128,128,0.2))", transition: "width .15s ease, height .15s ease" } },
                 React.createElement("img", { src: ei.url, style: { width: "100%", height: "100%", objectFit: "cover", display: "block" } }),
-                React.createElement("button", { type: "button", onClick: function(ev) { ev.stopPropagation(); var nxtRm = editImagesRef.current.filter(function(x) { return x.id !== ei.id; }); setEditImages(nxtRm); syncEditImgsToPending(nxtRm); }, style: { position: "absolute", top: "2px", right: "2px", width: "18px", height: "18px", borderRadius: "50%", border: "none", background: "rgba(0,0,0,0.55)", color: "#fff", fontSize: "12px", lineHeight: "18px", textAlign: "center", cursor: "pointer", padding: "0" }, title: "移除图片" }, "\u00d7")
+                React.createElement("button", { type: "button", onClick: function(ev) { ev.stopPropagation(); var nxtRm = editImagesRef.current.filter(function(x) { return x.id !== ei.id; }); setEditImages(nxtRm); syncEditImgsToPending(nxtRm); releaseEditImage(ei.id, "移除图片"); }, style: { position: "absolute", top: "2px", right: "2px", width: "18px", height: "18px", borderRadius: "50%", border: "none", background: "rgba(0,0,0,0.55)", color: "#fff", fontSize: "12px", lineHeight: "18px", textAlign: "center", cursor: "pointer", padding: "0" }, title: "移除图片" }, "\u00d7")
               );
             }),
             dzShow ? React.createElement(
@@ -3811,29 +4060,46 @@ window.__ModuleLoader__.load({
               onPaste: function (e) {
                 try {
                   var items = e.clipboardData ? e.clipboardData.items : [];
+                  // 旧实现在第一张图后无条件 break——粘贴多张只留第一张，
+                  // 且第一张创建失败时也照样 break（一张都加不进去）。改为先收集再统一建草稿。
+                  var pFiles = [];
                   for (var pi = 0; pi < items.length; pi++) {
                     if (items[pi].type && items[pi].type.indexOf("image") === 0) {
                       var pf = items[pi].getAsFile();
-                      if (pf) {
-                        e.preventDefault();
-                        var pImgs = ctxConversationRef && typeof ctxConversationRef.createDraftImages === "function" ? ctxConversationRef.createDraftImages([pf]) : null;
-                        if (pImgs && pImgs.length > 0) {
-                          var pItem = { id: pImgs[0].id, url: pImgs[0].previewUrl, dataUrl: null };
-                          setEditImages(function(prev) { var nxt = prev.concat([pItem]); syncEditImgsToPending(nxt); return nxt; });
-                          fileToDataUrl(pf).then(function (du) {
-                            pItem.dataUrl = du;
-                            setEditImages(function (prev2) {
-                              var nxt2 = prev2.map(function (x) { return x.id === pItem.id ? Object.assign({}, x, { dataUrl: du }) : x; });
-                              syncEditImgsToPending(nxt2);
-                              return nxt2;
-                            });
-                          }).catch(function () { /* ignore */ });
-                        }
-                        break;
-                      }
+                      if (pf) pFiles.push(pf);
                     }
                   }
-                } catch (pe) { /* ignore */ }
+                  if (pFiles.length === 0) return;
+                  e.preventDefault(); // 有图即阻断默认粘贴，避免图片被当文本/路径插入
+                  if (!canCreateDraftImages()) {
+                    log("warn", "edit", "粘贴图片跳过：缺创建草稿能力", { count: pFiles.length, bytes: pFiles.map(function(f) { return f.size || 0; }), hasConversation: !!ctxConversationRef });
+                    return;
+                  }
+                  var pImgs = createDraftImagesCompat(sessionId, pFiles);
+                  if (!pImgs || pImgs.length === 0) {
+                    log("warn", "edit", "粘贴图片创建草稿失败", { count: pFiles.length, bytes: pFiles.map(function(f) { return f.size || 0; }), hasConversation: !!ctxConversationRef });
+                    return;
+                  }
+                  // createDrafts 内部是 files.map 保序，下标可与 pFiles 配对
+                  var pItems = pImgs.map(function (im) { return { id: im.id, url: im.previewUrl, dataUrl: null }; });
+                  setEditImages(function (prev) { var nxt = prev.concat(pItems); syncEditImgsToPending(nxt); return nxt; });
+                  log("info", "edit", "粘贴图片已加入编辑", { count: pItems.length, names: pFiles.map(function(f) { return f && f.name ? f.name : ""; }), bytes: pFiles.map(function(f) { return f.size || 0; }) });
+                  pItems.forEach(function (pItem, pIdx) {
+                    var pSrc = pFiles[pIdx];
+                    if (!pSrc) return;
+                    fileToDataUrl(pSrc).then(function (du) {
+                      pItem.dataUrl = du;
+                      setEditImages(function (prev2) {
+                        var nxt2 = prev2.map(function (x) { return x.id === pItem.id ? Object.assign({}, x, { dataUrl: du }) : x; });
+                        syncEditImgsToPending(nxt2);
+                        return nxt2;
+                      });
+                    }).catch(function (eDu) {
+                      // 字节快照失败不影响本次会话内显示（previewUrl 仍有效），只影响刷新后恢复
+                      log("warn", "edit", "粘贴图片字节快照失败（刷新后无法恢复）", { id: pItem.id, err: String(eDu && eDu.message ? eDu.message : eDu) });
+                    });
+                  });
+                } catch (pe) { log("warn", "edit", "粘贴处理异常", { err: String(pe && pe.message ? pe.message : pe) }); }
               },
             }),
             React.createElement(
@@ -3873,14 +4139,18 @@ window.__ModuleLoader__.load({
       // 问题1 修复：气泡上方渲染消息中的图片附件（覆盖 chat.node 后官方图片槽不再自动注入）
       var pc = contentParts(data.content);
       var msgImages = pc && pc.images ? pc.images : [];
+      // 官方 UserContent 的 showBubble 规则：text !== "" || extraBlocks.length > 0。
+      // 纯图片消息（用户只发图）不该出现"（空消息）"：有图 → 省略气泡；既无文字又无图 → 才提示空消息。
+      var hasExtraBlocks = pc && pc.rest && pc.rest.length > 0;
+      var showBubble = text !== "" || hasExtraBlocks || msgImages.length === 0;
 
       return React.createElement(
         "div", { style: rowStyle, "data-dsh-easyrewrite": "user", "data-time-hover-root": true },
         renderMessageImagesCompat(msgImages, props),
-        React.createElement(
+        showBubble ? React.createElement(
           "div", { className: "dsh-easyrewrite-bubble", style: bubbleStyle, onClick: onBubbleClick, title: L.clickEdit },
           text || L.emptyMsg
-        ),
+        ) : null,
         confirming
           ? React.createElement(ConfirmCapsule, {
               text: afterCount === 0 ? L.recallText0 : (onlyUser ? L.recallTextQ.replace("{n}", String(afterCount)) : L.recallTextC.replace("{n}", String(afterCount))),
@@ -4086,6 +4356,26 @@ window.__ModuleLoader__.load({
           }
         } catch (eDbg) { /* ignore */ }
         try { ctxUiWorkspaceRef = ctx.uiWorkspace || ((typeof ctx.get === "function") ? (ctx.get("uiWorkspace") || null) : null); } catch (eUiw) { ctxUiWorkspaceRef = null; }
+        // 关键修复：此前这两个服务引用从未赋值（恒为 null），导致 createDraftImages /
+        // addImages / resolveImage 等 9 处判空全部静默失效——表现就是"编辑气泡时没有图片、
+        // 拖入粘贴图片无效"，且日志里一条都不打（因为都走了 guard 的 false 分支）。
+        try {
+          ctxConversationRef = ctx.conversation || ((typeof ctx.get === "function") ? (ctx.get("conversation") || null) : null);
+        } catch (eConv) { ctxConversationRef = null; }
+        try {
+          ctxUiConversationRef = ctx.uiConversation || ((typeof ctx.get === "function") ? (ctx.get("uiConversation") || null) : null);
+          // 兜底：uiConversation 未在插件 inject 列表声明时 ctx.get 拿不到，但它与 conversation 同属
+          // ui-conversation 包，可从已注入的 conversation 服务实例的 ctx 上取到兄弟服务。
+          if (!ctxUiConversationRef && ctxConversationRef && ctxConversationRef.ctx && typeof ctxConversationRef.ctx.get === "function") {
+            ctxUiConversationRef = ctxConversationRef.ctx.get("uiConversation") || null;
+          }
+        } catch (eUiConv) { ctxUiConversationRef = null; }
+        log("info", "lifecycle", "服务引用已就绪", {
+          hasConversation: !!ctxConversationRef,
+          createDrafts: !!(ctxConversationRef && typeof ctxConversationRef.createDrafts === "function"),
+          createDraftImages: !!(ctxConversationRef && typeof ctxConversationRef.createDraftImages === "function"),
+          hasUiConversation: !!ctxUiConversationRef
+        });
         function invokeOpenSession(id) {
           try {
             if (ctx.uiWorkspace && typeof ctx.uiWorkspace.openSession === "function") {
